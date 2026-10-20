@@ -1,0 +1,336 @@
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import and_, desc, func
+from sqlalchemy.orm import Session
+
+from app.core.dependencies import get_current_user
+from app.core.config import settings
+from app.db.sql import get_db_session
+from app.models.social_models import Community, CommunityMembership, CommunityMessage, CommunityOwner, CommunityPost, Post, User
+from app.schemas.social_schema import (
+    CommunityCreateRequest,
+    CommunityListResponse,
+    CommunityMemberItem,
+    CommunityMembersResponse,
+    CommunityPostCreate,
+    CommunitySummary,
+    CommunityUpdateRequest,
+    PostResponse,
+)
+from app.api.routes.posts import _build_post_response
+
+
+router = APIRouter(prefix="/communities", tags=["Communities"])
+
+
+def _is_community_manager(db: Session, community_id: int, user_id: int) -> bool:
+    owner = db.query(CommunityOwner).filter(CommunityOwner.community_id == community_id).first()
+    if owner:
+        return owner.user_id == user_id
+
+    first_member = (
+        db.query(CommunityMembership)
+        .filter(CommunityMembership.community_id == community_id)
+        .order_by(CommunityMembership.created_at.asc(), CommunityMembership.id.asc())
+        .first()
+    )
+    return bool(first_member and first_member.user_id == user_id)
+
+
+@router.get("", response_model=CommunityListResponse)
+def list_communities(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
+):
+    communities = db.query(Community).order_by(Community.name.asc()).all()
+    if not communities:
+        return CommunityListResponse(communities=[])
+
+    community_ids = [c.id for c in communities]
+
+    counts = (
+        db.query(CommunityMembership.community_id, func.count(CommunityMembership.id))
+        .join(User, User.id == CommunityMembership.user_id)
+        .filter(CommunityMembership.community_id.in_(community_ids))
+        .filter(
+            User.email.notlike("%@seed.example.com"),
+            User.email.notlike("%@seed.local"),
+        ) if settings.SOCIAL_HIDE_SEED_USERS else
+        db.query(CommunityMembership.community_id, func.count(CommunityMembership.id))
+        .filter(CommunityMembership.community_id.in_(community_ids))
+    )
+    counts = (
+        counts
+        .group_by(CommunityMembership.community_id)
+        .all()
+    )
+    count_map = {cid: cnt for cid, cnt in counts}
+
+    joined_rows = (
+        db.query(CommunityMembership.community_id)
+        .filter(
+            and_(
+                CommunityMembership.user_id == current_user.id,
+                CommunityMembership.community_id.in_(community_ids),
+            )
+        )
+        .all()
+    )
+    joined_set = {row[0] for row in joined_rows}
+    manageable_set = {c.id for c in communities if _is_community_manager(db, c.id, current_user.id)}
+
+    return CommunityListResponse(
+        communities=[
+            CommunitySummary(
+                id=c.id,
+                name=c.name,
+                description=c.description,
+                image_url=c.image_url,
+                member_count=int(count_map.get(c.id, 0)),
+                joined=c.id in joined_set,
+                can_manage=c.id in manageable_set,
+            )
+            for c in communities
+        ]
+    )
+
+
+@router.post("", response_model=CommunitySummary)
+def create_community(
+    payload: CommunityCreateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
+):
+    name = payload.name.strip()
+    description = payload.description.strip()
+    image_url = payload.image_url.strip() if payload.image_url else None
+
+    existing = db.query(Community).filter(func.lower(Community.name) == name.lower()).first()
+    if existing:
+        raise HTTPException(status_code=409, detail="Community already exists")
+
+    community = Community(name=name, description=description, image_url=image_url)
+    db.add(community)
+    db.flush()
+    db.add(CommunityMembership(community_id=community.id, user_id=current_user.id))
+    db.add(CommunityOwner(community_id=community.id, user_id=current_user.id))
+    db.commit()
+    db.refresh(community)
+
+    return CommunitySummary(
+        id=community.id,
+        name=community.name,
+        description=community.description,
+        image_url=community.image_url,
+        member_count=1,
+        joined=True,
+        can_manage=True,
+    )
+
+
+@router.patch("/{community_id}", response_model=CommunitySummary)
+def update_community(
+    community_id: int,
+    payload: CommunityUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
+):
+    community = db.query(Community).filter(Community.id == community_id).first()
+    if not community:
+        raise HTTPException(status_code=404, detail="Community not found")
+    if not _is_community_manager(db, community_id, current_user.id):
+        raise HTTPException(status_code=403, detail="Only the community manager can edit this community")
+
+    if payload.name is not None:
+        name = payload.name.strip()
+        existing = (
+            db.query(Community)
+            .filter(func.lower(Community.name) == name.lower(), Community.id != community_id)
+            .first()
+        )
+        if existing:
+            raise HTTPException(status_code=409, detail="Community name already exists")
+        community.name = name
+    if payload.description is not None:
+        community.description = payload.description.strip()
+    if payload.image_url is not None:
+        community.image_url = payload.image_url.strip() or None
+
+    db.add(community)
+    db.commit()
+    db.refresh(community)
+
+    count = db.query(func.count(CommunityMembership.id)).filter(CommunityMembership.community_id == community_id).scalar() or 0
+    joined = (
+        db.query(CommunityMembership)
+        .filter(CommunityMembership.community_id == community_id, CommunityMembership.user_id == current_user.id)
+        .first()
+        is not None
+    )
+    return CommunitySummary(
+        id=community.id,
+        name=community.name,
+        description=community.description,
+        image_url=community.image_url,
+        member_count=int(count),
+        joined=joined,
+        can_manage=True,
+    )
+
+
+@router.post("/{community_id}/join")
+def join_community(
+    community_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
+):
+    community = db.query(Community).filter(Community.id == community_id).first()
+    if not community:
+        raise HTTPException(status_code=404, detail="Community not found")
+
+    existing = (
+        db.query(CommunityMembership)
+        .filter(and_(CommunityMembership.community_id == community_id, CommunityMembership.user_id == current_user.id))
+        .first()
+    )
+    if existing:
+        return {"success": True, "message": "Already joined"}
+
+    db.add(CommunityMembership(community_id=community_id, user_id=current_user.id))
+    db.commit()
+    return {"success": True, "message": "Joined"}
+
+
+@router.delete("/{community_id}/leave")
+def leave_community(
+    community_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
+):
+    membership = (
+        db.query(CommunityMembership)
+        .filter(and_(CommunityMembership.community_id == community_id, CommunityMembership.user_id == current_user.id))
+        .first()
+    )
+    if not membership:
+        return {"success": True, "message": "Not a member"}
+
+    db.delete(membership)
+    db.commit()
+    return {"success": True, "message": "Left"}
+
+
+@router.delete("/{community_id}")
+def delete_community(
+    community_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
+):
+    community = db.query(Community).filter(Community.id == community_id).first()
+    if not community:
+        raise HTTPException(status_code=404, detail="Community not found")
+
+    if not _is_community_manager(db, community_id, current_user.id):
+        raise HTTPException(status_code=403, detail="Only the community manager can delete this community")
+
+    db.query(CommunityOwner).filter(CommunityOwner.community_id == community_id).delete(synchronize_session=False)
+    db.query(CommunityMessage).filter(CommunityMessage.community_id == community_id).delete(synchronize_session=False)
+    db.query(CommunityPost).filter(CommunityPost.community_id == community_id).delete(synchronize_session=False)
+    db.query(CommunityMembership).filter(CommunityMembership.community_id == community_id).delete(synchronize_session=False)
+    db.delete(community)
+    db.commit()
+    return {"success": True}
+
+
+@router.get("/{community_id}/members", response_model=CommunityMembersResponse)
+def get_members(
+    community_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
+):
+    community = db.query(Community).filter(Community.id == community_id).first()
+    if not community:
+        raise HTTPException(status_code=404, detail="Community not found")
+
+    rows = (
+        db.query(User)
+        .join(CommunityMembership, CommunityMembership.user_id == User.id)
+        .filter(CommunityMembership.community_id == community_id)
+        .filter(
+            User.email.notlike("%@seed.example.com"),
+            User.email.notlike("%@seed.local"),
+        ) if settings.SOCIAL_HIDE_SEED_USERS else
+        db.query(User)
+        .join(CommunityMembership, CommunityMembership.user_id == User.id)
+        .filter(CommunityMembership.community_id == community_id)
+    )
+    rows = (
+        rows
+        .order_by(User.username.asc())
+        .all()
+    )
+    return CommunityMembersResponse(
+        members=[
+            CommunityMemberItem(id=u.id, username=u.username, avatar_url=u.avatar_url, bio=u.bio)
+            for u in rows
+        ]
+    )
+
+
+@router.get("/{community_id}/posts", response_model=list[PostResponse])
+def list_community_posts(
+    community_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
+):
+    community = db.query(Community).filter(Community.id == community_id).first()
+    if not community:
+        raise HTTPException(status_code=404, detail="Community not found")
+
+    post_ids = (
+        db.query(CommunityPost.post_id)
+        .filter(CommunityPost.community_id == community_id)
+        .order_by(desc(CommunityPost.created_at))
+        .all()
+    )
+    ids = [pid for (pid,) in post_ids]
+    if not ids:
+        return []
+
+    posts_query = db.query(Post).join(User, User.id == Post.user_id).filter(Post.id.in_(ids))
+    if settings.SOCIAL_HIDE_SEED_USERS:
+        posts_query = posts_query.filter(User.email.notlike("%@seed.example.com")).filter(User.email.notlike("%@seed.local"))
+    posts = posts_query.all()
+    post_map = {p.id: p for p in posts}
+    ordered = [post_map[i] for i in ids if i in post_map]
+    return [_build_post_response(db, p, current_user.id) for p in ordered]
+
+
+@router.post("/{community_id}/posts", response_model=PostResponse)
+def create_community_post(
+    community_id: int,
+    payload: CommunityPostCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
+):
+    membership = (
+        db.query(CommunityMembership)
+        .filter(and_(CommunityMembership.community_id == community_id, CommunityMembership.user_id == current_user.id))
+        .first()
+    )
+    if not membership:
+        raise HTTPException(status_code=403, detail="Join community before posting")
+
+    from app.models.social_models import PostMedia
+
+    caption = payload.caption.strip()
+    if payload.movie_title:
+        caption = f"Review on {payload.movie_title.strip()}\n\n{caption}".strip()
+
+    post = Post(user_id=current_user.id, image_url=payload.image_url.strip(), caption=caption)
+    db.add(post)
+    db.flush()
+    db.add(PostMedia(post_id=post.id, image_url=payload.image_url.strip(), position=0))
+    db.add(CommunityPost(community_id=community_id, post_id=post.id))
+    db.commit()
+    db.refresh(post)
+    return _build_post_response(db, post, current_user.id)

@@ -1,0 +1,339 @@
+import React, { useEffect, useMemo, useState } from 'react';
+import { Heart, MessageCircle, Share2, Bookmark, MoreHorizontal, ChevronLeft, ChevronRight, Pencil, Trash2 } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
+
+import { Button } from '../ui/Button';
+import { Avatar } from '../ui/Avatar';
+import { Skeleton } from '../ui/Skeleton';
+import { cn } from '../../utils/cn';
+import { shareUrl } from '../../utils/share';
+
+export interface User {
+    id: string;
+    name: string;
+    avatar: string;
+    handle: string;
+}
+
+export interface PostComment {
+    id: string;
+    username: string;
+    text: string;
+}
+
+export interface Post {
+    id: string;
+    user: User;
+    imageUrl: string;
+    imageUrls?: string[];
+    content: string;
+    likes: number;
+    comments: number;
+    timeAgo: string;
+    isLikedByMe?: boolean;
+    isSavedByMe?: boolean;
+}
+
+interface FeedPostProps {
+    post: Post;
+    className?: string;
+    style?: React.CSSProperties;
+    onLikeToggle?: (postId: string, currentlyLiked: boolean) => Promise<void> | void;
+    onAddComment?: (postId: string, content: string) => Promise<void> | void;
+    onLoadComments?: (postId: string) => Promise<PostComment[]>;
+    canDelete?: boolean;
+    onDeletePost?: (postId: string) => Promise<void> | void;
+    canEdit?: boolean;
+    onEditPost?: (postId: string, caption: string) => Promise<void> | void;
+    onSaveToggle?: (postId: string, currentlySaved: boolean) => Promise<void> | void;
+}
+
+export const FeedPost = React.memo(({ post, className, style, onLikeToggle, onAddComment, onLoadComments, canDelete = false, onDeletePost, canEdit = false, onEditPost, onSaveToggle }: FeedPostProps) => {
+    const navigate = useNavigate();
+    const [liked, setLiked] = useState(post.isLikedByMe || false);
+    const [saved, setSaved] = useState(post.isSavedByMe || false);
+    const [likeCount, setLikeCount] = useState(post.likes);
+    const [commentCount, setCommentCount] = useState(post.comments);
+    const [commentText, setCommentText] = useState('');
+    const [comments, setComments] = useState<PostComment[]>([]);
+    const [loadingComments, setLoadingComments] = useState(false);
+    const [currentImage, setCurrentImage] = useState(0);
+    const [menuOpen, setMenuOpen] = useState(false);
+    const [deleting, setDeleting] = useState(false);
+    const [editing, setEditing] = useState(false);
+    const [editText, setEditText] = useState(post.content);
+    const [savingEdit, setSavingEdit] = useState(false);
+    const [imageLoaded, setImageLoaded] = useState(false);
+
+    const images = useMemo(() => (post.imageUrls && post.imageUrls.length ? post.imageUrls : [post.imageUrl]), [post.imageUrl, post.imageUrls]);
+    const captionParts = useMemo(() => post.content.split(/(#[a-zA-Z0-9_]+)/g), [post.content]);
+
+    useEffect(() => {
+        setLiked(post.isLikedByMe || false);
+        setSaved(post.isSavedByMe || false);
+        setLikeCount(post.likes);
+        setCommentCount(post.comments);
+        setEditText(post.content);
+    }, [post.comments, post.content, post.isLikedByMe, post.isSavedByMe, post.likes]);
+
+    useEffect(() => {
+        let mounted = true;
+        const load = async () => {
+            if (!onLoadComments) return;
+            setLoadingComments(true);
+            try {
+                const rows = await onLoadComments(post.id);
+                if (mounted) setComments(rows);
+            } catch {
+                if (mounted) setComments([]);
+            } finally {
+                if (mounted) setLoadingComments(false);
+            }
+        };
+        load();
+        return () => {
+            mounted = false;
+        };
+    }, [onLoadComments, post.id]);
+
+    const handleLike = async () => {
+        const nextLiked = !liked;
+        setLiked(nextLiked);
+        setLikeCount((prev) => (nextLiked ? prev + 1 : prev - 1));
+        try {
+            if (onLikeToggle) await onLikeToggle(post.id, liked);
+        } catch {
+            setLiked(liked);
+            setLikeCount(post.likes);
+        }
+    };
+
+    const handlePostComment = async () => {
+        if (!commentText.trim()) return;
+        try {
+            if (onAddComment) await onAddComment(post.id, commentText);
+            setComments((prev) => [...prev, { id: `temp-${Date.now()}`, username: 'you', text: commentText.trim() }]);
+            setCommentCount((c) => c + 1);
+            setCommentText('');
+        } catch {
+            // ignore for now
+        }
+    };
+
+    const handleDelete = async () => {
+        if (!onDeletePost) return;
+        const confirmed = window.confirm('Delete this post?');
+        if (!confirmed) return;
+        setDeleting(true);
+        try {
+            await onDeletePost(post.id);
+            setMenuOpen(false);
+        } catch (error) {
+            alert((error as Error).message || 'Failed to delete post');
+        } finally {
+            setDeleting(false);
+        }
+    };
+
+    const handleSaveToggle = async () => {
+        const nextSaved = !saved;
+        setSaved(nextSaved);
+        try {
+            await onSaveToggle?.(post.id, saved);
+        } catch (error) {
+            setSaved(saved);
+            alert((error as Error).message || 'Failed to update saved post');
+        }
+    };
+
+    const handleEdit = async () => {
+        if (!onEditPost || !editText.trim()) return;
+        setSavingEdit(true);
+        try {
+            await onEditPost(post.id, editText.trim());
+            setEditing(false);
+            setMenuOpen(false);
+        } catch (error) {
+            alert((error as Error).message || 'Failed to edit post');
+        } finally {
+            setSavingEdit(false);
+        }
+    };
+
+    const handleShare = async () => {
+        const url = `${window.location.origin}/feed?post=${post.id}`;
+        await shareUrl(`${post.user.name}'s post`, post.content.slice(0, 120), url);
+    };
+
+    const currentImageUrl = images[currentImage];
+
+    return (
+        <div style={style} className={cn('glassmorphism rounded-xl overflow-hidden border border-white/10 shadow-lg', className)}>
+            <div className="flex items-center justify-between p-4">
+                <div className="flex items-center gap-3">
+                    <button type="button" onClick={() => navigate(`/profile/${post.user.handle}`)}>
+                        <Avatar src={post.user.avatar} name={post.user.name} className="w-10 h-10 border border-white/20" textClassName="text-xs" />
+                    </button>
+                    <button type="button" className="text-left" onClick={() => navigate(`/profile/${post.user.handle}`)}>
+                        <h4 className="font-semibold text-sm text-foreground">{post.user.name}</h4>
+                        <p className="text-xs text-secondary-foreground">@{post.user.handle} - {post.timeAgo}</p>
+                    </button>
+                </div>
+                {(canDelete || canEdit) && (
+                    <div className="relative">
+                        <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-8 w-8 p-0 text-secondary-foreground hover:text-white rounded-full"
+                            onClick={() => setMenuOpen((prev) => !prev)}
+                        >
+                            <MoreHorizontal className="w-5 h-5" />
+                        </Button>
+                        {menuOpen && (
+                            <div className="absolute right-0 mt-2 w-40 rounded-lg border border-white/10 bg-[#111] shadow-xl z-20 overflow-hidden">
+                                {canEdit && (
+                                    <button
+                                        type="button"
+                                        className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-gray-200 hover:bg-white/10"
+                                        onClick={() => {
+                                            setEditing(true);
+                                            setMenuOpen(false);
+                                        }}
+                                    >
+                                        <Pencil className="w-4 h-4" />
+                                        Edit caption
+                                    </button>
+                                )}
+                                {canDelete && (
+                                <button
+                                    type="button"
+                                    className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-red-400 hover:bg-white/10 disabled:opacity-60"
+                                    onClick={handleDelete}
+                                    disabled={deleting}
+                                >
+                                    <Trash2 className="w-4 h-4" />
+                                    {deleting ? 'Deleting...' : 'Delete post'}
+                                </button>
+                                )}
+                            </div>
+                        )}
+                    </div>
+                )}
+            </div>
+
+            <div className="px-4 relative min-h-[300px] flex items-center justify-center bg-black/40 rounded-lg border border-white/10 mx-4 overflow-hidden group">
+                {!imageLoaded && (
+                    <div className="absolute inset-0 flex items-center justify-center z-0">
+                         <Skeleton className="w-full h-full absolute inset-0 rounded-none" variant="card" />
+                    </div>
+                )}
+                <img
+                    src={currentImageUrl}
+                    alt="post"
+                    onLoad={() => setImageLoaded(true)}
+                    className={cn(
+                        "w-full max-h-[520px] object-contain object-center z-10 transition-opacity duration-500",
+                        imageLoaded ? "opacity-100" : "opacity-0"
+                    )}
+                    onError={(e) => {
+                        setImageLoaded(true);
+                        e.currentTarget.src = '/vite.svg';
+                    }}
+                />
+                
+                {images.length > 1 && (
+                    <>
+                        <button className="absolute left-2 top-1/2 -translate-y-1/2 bg-black/60 p-1.5 rounded-full z-20 opacity-0 group-hover:opacity-100 transition-opacity" onClick={() => { setImageLoaded(false); setCurrentImage((i) => (i - 1 + images.length) % images.length); }}>
+                            <ChevronLeft className="w-4 h-4 text-white" />
+                        </button>
+                        <button className="absolute right-2 top-1/2 -translate-y-1/2 bg-black/60 p-1.5 rounded-full z-20 opacity-0 group-hover:opacity-100 transition-opacity" onClick={() => { setImageLoaded(false); setCurrentImage((i) => (i + 1) % images.length); }}>
+                            <ChevronRight className="w-4 h-4 text-white" />
+                        </button>
+                        <div className="absolute bottom-3 left-1/2 -translate-x-1/2 flex gap-1.5 z-20">
+                            {images.map((_, idx) => <span key={idx} className={cn('w-1.5 h-1.5 rounded-full transition-all', idx === currentImage ? 'bg-white scale-125' : 'bg-white/40')} />)}
+                        </div>
+                    </>
+                )}
+            </div>
+
+            <div className="px-4 py-4">
+                {editing ? (
+                    <div className="space-y-3">
+                        <textarea
+                            value={editText}
+                            onChange={(e) => setEditText(e.target.value)}
+                            rows={4}
+                            maxLength={2200}
+                            className="w-full rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-sm text-white focus:outline-none focus:ring-2 focus:ring-primary/50"
+                        />
+                        <div className="flex justify-end gap-2">
+                            <Button size="sm" variant="outline" onClick={() => { setEditing(false); setEditText(post.content); }}>Cancel</Button>
+                            <Button size="sm" onClick={handleEdit} disabled={!editText.trim() || savingEdit}>
+                                {savingEdit ? 'Saving...' : 'Save'}
+                            </Button>
+                        </div>
+                    </div>
+                ) : (
+                    <p className="text-sm md:text-base text-gray-200 leading-relaxed whitespace-pre-wrap">
+                        {captionParts.map((part, index) =>
+                            part.startsWith('#') ? (
+                                <span key={`${part}-${index}`} className="font-semibold text-primary">
+                                    {part}
+                                </span>
+                            ) : (
+                                <React.Fragment key={`${part}-${index}`}>{part}</React.Fragment>
+                            )
+                        )}
+                    </p>
+                )}
+            </div>
+
+            <div className="px-4 py-3 border-t border-white/10 flex items-center justify-between">
+                <div className="flex items-center gap-4">
+                    <button onClick={handleLike} className="flex items-center gap-1.5 text-secondary-foreground hover:text-red-500 transition-colors group">
+                        <Heart className={cn('w-6 h-6 transition-transform group-hover:scale-110', liked && 'text-red-500 fill-red-500')} />
+                        <span className={cn('text-sm font-medium', liked && 'text-red-500')}>{likeCount}</span>
+                    </button>
+
+                    <div className="flex items-center gap-1.5 text-secondary-foreground">
+                        <MessageCircle className="w-6 h-6" />
+                        <span className="text-sm font-medium">{commentCount}</span>
+                    </div>
+
+                    <button onClick={handleShare} className="flex items-center gap-1.5 text-secondary-foreground hover:text-primary transition-colors group">
+                        <Share2 className="w-6 h-6 transition-transform group-hover:scale-110" />
+                    </button>
+                </div>
+
+                <button onClick={handleSaveToggle} className="text-secondary-foreground hover:text-white transition-all group" title={saved ? 'Remove from saved' : 'Save post'}>
+                    <Bookmark className={cn('w-6 h-6 transition-transform group-hover:scale-110', saved && 'text-white fill-white')} />
+                </button>
+            </div>
+
+            <div className="px-4 pb-4 border-t border-white/10">
+                <div className="max-h-36 overflow-auto space-y-1 py-3">
+                    {loadingComments ? (
+                        <p className="text-xs text-gray-400">Loading comments...</p>
+                    ) : comments.length === 0 ? (
+                        <p className="text-xs text-gray-500">No comments yet.</p>
+                    ) : (
+                        comments.map((c) => (
+                            <p key={c.id} className="text-sm text-gray-200"><span className="font-semibold text-white mr-2">{c.username}</span>{c.text}</p>
+                        ))
+                    )}
+                </div>
+                <div className="flex gap-2">
+                    <input
+                        value={commentText}
+                        onChange={(e) => setCommentText(e.target.value)}
+                        placeholder="Add a comment..."
+                        className="flex-1 bg-black/30 border border-white/10 rounded-lg px-3 py-2 text-sm"
+                    />
+                    <Button size="sm" onClick={handlePostComment}>Post</Button>
+                </div>
+            </div>
+        </div>
+    );
+});
+
+

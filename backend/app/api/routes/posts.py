@@ -1,0 +1,437 @@
+import re
+import shutil
+import uuid
+from pathlib import Path
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
+from sqlalchemy import and_, desc, func
+from sqlalchemy.orm import Session
+
+from app.core.dependencies import get_current_user
+from app.db.sql import get_db_session
+from app.models.social_models import Comment, CommunityPost, Follow, Like, Post, PostMedia, SavedPost, User, UserBlock
+from app.schemas.social_schema import (
+    CommentCreateRequest,
+    CommentResponse,
+    PostAuthor,
+    PostCommentItem,
+    PostCreateRequest,
+    PostResponse,
+    PostUpdateRequest,
+)
+from app.services.notification_service import create_notification
+from app.services.social_guard import is_blocked_either_direction
+
+
+router = APIRouter(prefix="/posts", tags=["Posts"])
+UPLOAD_DIR = Path(__file__).resolve().parents[3] / "uploads" / "posts"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+MENTION_RE = re.compile(r"@([A-Za-z0-9_.]{3,50})")
+
+
+def _build_post_response(db: Session, post: Post, current_user_id: int) -> PostResponse:
+    likes_count = db.query(func.count(Like.id)).filter(Like.post_id == post.id).scalar() or 0
+    comments_count = db.query(func.count(Comment.id)).filter(Comment.post_id == post.id).scalar() or 0
+    is_liked = (
+        db.query(Like)
+        .filter(and_(Like.post_id == post.id, Like.user_id == current_user_id))
+        .first()
+        is not None
+    )
+    is_saved = (
+        db.query(SavedPost)
+        .filter(and_(SavedPost.post_id == post.id, SavedPost.user_id == current_user_id))
+        .first()
+        is not None
+    )
+    author = db.query(User).filter(User.id == post.user_id).first()
+    if not author:
+        raise HTTPException(status_code=404, detail="Post author not found")
+
+    media = (
+        db.query(PostMedia)
+        .filter(PostMedia.post_id == post.id)
+        .order_by(PostMedia.position.asc(), PostMedia.id.asc())
+        .all()
+    )
+    image_urls = [m.image_url for m in media] or [post.image_url]
+
+    return PostResponse(
+        id=post.id,
+        user_id=post.user_id,
+        image_url=post.image_url,
+        caption=post.caption,
+        created_at=post.created_at,
+        likes_count=likes_count,
+        comments_count=comments_count,
+        is_liked=is_liked,
+        is_saved=is_saved,
+        author=PostAuthor(id=author.id, username=author.username, avatar_url=author.avatar_url),
+        image_urls=image_urls,
+    )
+
+
+def _blocked_user_ids(db: Session, user_id: int) -> set[int]:
+    rows = (
+        db.query(UserBlock)
+        .filter((UserBlock.blocker_id == user_id) | (UserBlock.blocked_id == user_id))
+        .all()
+    )
+    blocked: set[int] = set()
+    for row in rows:
+        if row.blocker_id == user_id:
+            blocked.add(row.blocked_id)
+        if row.blocked_id == user_id:
+            blocked.add(row.blocker_id)
+    return blocked
+
+
+def _notify_mentions(db: Session, content: str, actor: User, post: Post) -> None:
+    usernames = {match.group(1).lower() for match in MENTION_RE.finditer(content)}
+    if not usernames:
+        return
+    users = db.query(User).filter(func.lower(User.username).in_(usernames)).all()
+    for user in users:
+        if user.id == actor.id or is_blocked_either_direction(db, actor.id, user.id):
+            continue
+        create_notification(
+            db,
+            user_id=user.id,
+            actor_id=actor.id,
+            notif_type="mention",
+            message=f"{actor.username} mentioned you in a comment",
+            resource_id=post.id,
+        )
+
+
+@router.post("", response_model=PostResponse)
+def create_post(
+    payload: PostCreateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
+):
+    caption = payload.caption.strip()
+    if payload.movie_title:
+        caption = f"Review on {payload.movie_title.strip()}\n\n{caption}".strip()
+
+    post = Post(user_id=current_user.id, image_url=payload.image_url.strip(), caption=caption)
+    db.add(post)
+    db.flush()
+    db.add(PostMedia(post_id=post.id, image_url=payload.image_url.strip(), position=0))
+    db.commit()
+    db.refresh(post)
+    return _build_post_response(db, post, current_user.id)
+
+
+@router.post("/upload", response_model=PostResponse)
+def create_post_with_upload(
+    request: Request,
+    caption: str = Form(default=""),
+    movie_title: str | None = Form(default=None),
+    image_url: str | None = Form(default=None),
+    image_file: UploadFile | None = File(default=None),
+    image_files: list[UploadFile] | None = File(default=None),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
+):
+    normalized_caption = caption.strip()
+    if movie_title and movie_title.strip():
+        normalized_caption = f"Review on {movie_title.strip()}\n\n{normalized_caption}".strip()
+
+    final_image_url = (image_url or "").strip()
+    gathered_urls: list[str] = []
+
+    if final_image_url:
+        gathered_urls.append(final_image_url)
+
+    files_to_process = []
+    if image_files:
+        files_to_process.extend([f for f in image_files if f and f.filename])
+    if image_file and image_file.filename:
+        files_to_process.append(image_file)
+
+    for file_obj in files_to_process:
+        ext = Path(file_obj.filename).suffix.lower()
+        allowed = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+        if ext not in allowed:
+            raise HTTPException(status_code=400, detail="Only image files are allowed")
+
+        file_name = f"{uuid.uuid4().hex}{ext}"
+        destination = UPLOAD_DIR / file_name
+        with destination.open("wb") as buffer:
+            shutil.copyfileobj(file_obj.file, buffer)
+        gathered_urls.append(f"{request.base_url}uploads/posts/{file_name}".rstrip("/"))
+
+    if not gathered_urls:
+        raise HTTPException(status_code=400, detail="Provide an image URL or upload an image file")
+
+    post = Post(user_id=current_user.id, image_url=gathered_urls[0], caption=normalized_caption)
+    db.add(post)
+    db.flush()
+    for idx, media_url in enumerate(gathered_urls):
+        db.add(PostMedia(post_id=post.id, image_url=media_url, position=idx))
+    db.commit()
+    db.refresh(post)
+    return _build_post_response(db, post, current_user.id)
+
+
+@router.get("/saved", response_model=list[PostResponse])
+def get_saved_posts(
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
+):
+    rows = (
+        db.query(SavedPost)
+        .filter(SavedPost.user_id == current_user.id)
+        .order_by(desc(SavedPost.created_at))
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+    post_ids = [row.post_id for row in rows]
+    if not post_ids:
+        return []
+    posts = db.query(Post).filter(Post.id.in_(post_ids)).all()
+    post_map = {post.id: post for post in posts}
+    return [_build_post_response(db, post_map[post_id], current_user.id) for post_id in post_ids if post_id in post_map]
+
+
+@router.delete("/{post_id}")
+def delete_post(
+    post_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
+):
+    post = db.query(Post).filter(Post.id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    if post.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="You can only delete your own posts")
+
+    db.query(SavedPost).filter(SavedPost.post_id == post_id).delete(synchronize_session=False)
+    db.query(Like).filter(Like.post_id == post_id).delete(synchronize_session=False)
+    db.query(Comment).filter(Comment.post_id == post_id).delete(synchronize_session=False)
+    db.query(CommunityPost).filter(CommunityPost.post_id == post_id).delete(synchronize_session=False)
+    db.delete(post)
+    db.commit()
+    return {"success": True}
+
+
+@router.patch("/{post_id}", response_model=PostResponse)
+def update_post(
+    post_id: int,
+    payload: PostUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
+):
+    post = db.query(Post).filter(Post.id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    if post.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="You can only edit your own posts")
+    post.caption = payload.caption.strip()
+    db.add(post)
+    db.commit()
+    db.refresh(post)
+    return _build_post_response(db, post, current_user.id)
+
+
+@router.get("/feed", response_model=list[PostResponse])
+def get_feed(
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
+):
+    following_subquery = db.query(Follow.following_id).filter(Follow.follower_id == current_user.id)
+    blocked_ids = _blocked_user_ids(db, current_user.id)
+
+    query = (
+        db.query(Post)
+        .filter((Post.user_id == current_user.id) | (Post.user_id.in_(following_subquery)))
+    )
+    if blocked_ids:
+        query = query.filter(~Post.user_id.in_(blocked_ids))
+    posts = query.order_by(desc(Post.created_at)).offset(offset).limit(limit).all()
+    return [_build_post_response(db, post, current_user.id) for post in posts]
+
+
+@router.get("/user/{user_id}", response_model=list[PostResponse])
+def get_posts_by_user(
+    user_id: int,
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
+):
+    if is_blocked_either_direction(db, current_user.id, user_id):
+        raise HTTPException(status_code=403, detail="Posts unavailable")
+    posts = (
+        db.query(Post)
+        .filter(Post.user_id == user_id)
+        .order_by(desc(Post.created_at))
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+    return [_build_post_response(db, post, current_user.id) for post in posts]
+
+
+@router.post("/{post_id}/like")
+def like_post(
+    post_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
+):
+    post = db.query(Post).filter(Post.id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    if is_blocked_either_direction(db, current_user.id, post.user_id):
+        raise HTTPException(status_code=403, detail="Action not allowed")
+
+    existing = db.query(Like).filter(and_(Like.post_id == post_id, Like.user_id == current_user.id)).first()
+    if existing:
+        return {"success": True, "message": "Already liked"}
+
+    db.add(Like(post_id=post_id, user_id=current_user.id))
+    create_notification(
+        db,
+        user_id=post.user_id,
+        actor_id=current_user.id,
+        notif_type="like",
+        message=f"{current_user.username} liked your post",
+        resource_id=post.id,
+    )
+    db.commit()
+    return {"success": True, "message": "Liked"}
+
+
+@router.delete("/{post_id}/like")
+def unlike_post(
+    post_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
+):
+    existing = db.query(Like).filter(and_(Like.post_id == post_id, Like.user_id == current_user.id)).first()
+    if not existing:
+        return {"success": True, "message": "Not liked"}
+
+    db.delete(existing)
+    db.commit()
+    return {"success": True, "message": "Unliked"}
+
+
+@router.post("/{post_id}/save")
+def save_post(
+    post_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
+):
+    post = db.query(Post).filter(Post.id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    if is_blocked_either_direction(db, current_user.id, post.user_id):
+        raise HTTPException(status_code=403, detail="Action not allowed")
+
+    existing = db.query(SavedPost).filter(and_(SavedPost.post_id == post_id, SavedPost.user_id == current_user.id)).first()
+    if existing:
+        return {"success": True, "message": "Already saved"}
+
+    db.add(SavedPost(post_id=post_id, user_id=current_user.id))
+    db.commit()
+    return {"success": True, "message": "Saved"}
+
+
+@router.delete("/{post_id}/save")
+def unsave_post(
+    post_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
+):
+    existing = db.query(SavedPost).filter(and_(SavedPost.post_id == post_id, SavedPost.user_id == current_user.id)).first()
+    if not existing:
+        return {"success": True, "message": "Not saved"}
+
+    db.delete(existing)
+    db.commit()
+    return {"success": True, "message": "Unsaved"}
+
+
+@router.post("/{post_id}/comment", response_model=CommentResponse)
+def add_comment(
+    post_id: int,
+    payload: CommentCreateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
+):
+    post = db.query(Post).filter(Post.id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    if is_blocked_either_direction(db, current_user.id, post.user_id):
+        raise HTTPException(status_code=403, detail="Action not allowed")
+
+    comment = Comment(post_id=post_id, user_id=current_user.id, content=payload.content.strip())
+    db.add(comment)
+    create_notification(
+        db,
+        user_id=post.user_id,
+        actor_id=current_user.id,
+        notif_type="comment",
+        message=f"{current_user.username} commented on your post",
+        resource_id=post.id,
+    )
+    _notify_mentions(db, comment.content, current_user, post)
+    db.commit()
+    db.refresh(comment)
+
+    return CommentResponse(
+        id=comment.id,
+        post_id=comment.post_id,
+        user_id=comment.user_id,
+        content=comment.content,
+        created_at=comment.created_at,
+        author=PostAuthor(id=current_user.id, username=current_user.username, avatar_url=current_user.avatar_url),
+    )
+
+
+@router.get("/{post_id}/comments", response_model=list[PostCommentItem])
+def list_comments(
+    post_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db_session),
+):
+    post = db.query(Post).filter(Post.id == post_id).first()
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    if is_blocked_either_direction(db, current_user.id, post.user_id):
+        raise HTTPException(status_code=403, detail="Comments unavailable")
+
+    comments = (
+        db.query(Comment)
+        .filter(Comment.post_id == post_id)
+        .order_by(Comment.created_at.asc())
+        .all()
+    )
+    blocked_ids = _blocked_user_ids(db, current_user.id)
+    if blocked_ids:
+        comments = [c for c in comments if c.user_id not in blocked_ids]
+
+    user_ids = {c.user_id for c in comments}
+    users = db.query(User).filter(User.id.in_(user_ids)).all() if user_ids else []
+    user_map = {u.id: u for u in users}
+
+    return [
+        PostCommentItem(
+            id=c.id,
+            content=c.content,
+            created_at=c.created_at,
+            author=PostAuthor(
+                id=c.user_id,
+                username=user_map[c.user_id].username if c.user_id in user_map else "unknown",
+                avatar_url=user_map[c.user_id].avatar_url if c.user_id in user_map else None,
+            ),
+        )
+        for c in comments
+    ]
