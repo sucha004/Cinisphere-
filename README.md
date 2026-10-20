@@ -1,5 +1,5 @@
 # CiniSphere Interview Revision README
-
+Live Demo: [click here](cinisphere-app.vercel.app)
 CiniSphere is a full-stack movie discovery and social platform. It combines a movie browsing experience, personalized recommendations, mood/survey-based recommendations, watchlists, user profiles, posts, communities, direct/community chat, notifications, and moderation.
 
 The project is split into three main parts:
